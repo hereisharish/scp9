@@ -1,0 +1,196 @@
+package com.sohamkamani.mcp_shopping_list;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import java.io.IOException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
+
+/**
+ * SSE endpoint for MCP Inspector compatibility
+ * Provides HTTPS/SSE transport for MCP protocol testing
+ */
+@RestController
+@RequestMapping("/mcp")
+@CrossOrigin(origins = "*", allowedHeaders = "*", methods = {RequestMethod.GET, RequestMethod.POST, RequestMethod.OPTIONS})
+public class McpSseController {
+
+    private final Map<String, SseEmitter> clients = new ConcurrentHashMap<>();
+    
+    @Autowired
+    private ShoppingCart shoppingCart;
+    
+    @GetMapping(value = "/sse", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter handleSseConnection() {
+        SseEmitter emitter = new SseEmitter(0L); // No timeout for MCP connections
+        String clientId = "client_" + System.currentTimeMillis();
+        
+        clients.put(clientId, emitter);
+        
+        emitter.onCompletion(() -> clients.remove(clientId));
+        emitter.onTimeout(() -> clients.remove(clientId));
+        emitter.onError(e -> clients.remove(clientId));
+        
+        try {
+            // MCP Inspector expects specific message format
+            // Send initialization message
+            emitter.send(SseEmitter.event()
+                .data("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}"));
+                
+        } catch (IOException e) {
+            emitter.completeWithError(e);
+        }
+        
+        return emitter;
+    }
+    
+    @PostMapping(value = "/sse", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<Map<String, Object>> handleSsePost(@RequestBody Map<String, Object> message) {
+        System.out.println("Received MCP SSE POST message: " + message);
+        
+        String method = (String) message.get("method");
+        Object id = message.get("id");
+        
+        // Handle notifications (no response needed)
+        if (method != null && method.startsWith("notifications/")) {
+            return ResponseEntity.ok(Map.of("status", "received"));
+        }
+        
+        // Handle MCP protocol messages
+        Map<String, Object> response = new ConcurrentHashMap<>();
+        response.put("jsonrpc", "2.0");
+        if (id != null) {
+            response.put("id", id);
+        }
+        
+        if ("initialize".equals(method)) {
+            Map<String, Object> capabilities = Map.of(
+                "tools", Map.of(),
+                "resources", Map.of(),
+                "prompts", Map.of()
+            );
+            
+            Map<String, Object> serverInfo = Map.of(
+                "name", "shopping-list-mcp-server",
+                "version", "1.0.0"
+            );
+            
+            Map<String, Object> result = Map.of(
+                "protocolVersion", "2024-11-05",
+                "capabilities", capabilities,
+                "serverInfo", serverInfo
+            );
+            
+            response.put("result", result);
+        } else if ("tools/list".equals(method)) {
+            List<Map<String, Object>> tools = new ArrayList<>();
+            
+            // addItem tool with proper schema
+            tools.add(Map.of(
+                "name", "addItem",
+                "description", "Add an item to the shopping list or update its quantity. Specify item name and quantity.",
+                "inputSchema", Map.of(
+                    "type", "object",
+                    "properties", Map.of(
+                        "name", Map.of("type", "string", "description", "Item name"),
+                        "quantity", Map.of("type", "integer", "description", "Quantity to add")
+                    ),
+                    "required", new String[]{"name", "quantity"}
+                )
+            ));
+            
+            // getItems tool with proper schema
+            tools.add(Map.of(
+                "name", "getItems",
+                "description", "Get all items currently in the shopping list. Returns a list of items with their names and quantities.",
+                "inputSchema", Map.of(
+                    "type", "object",
+                    "properties", Map.of()
+                )
+            ));
+            
+            // removeItem tool with proper schema
+            tools.add(Map.of(
+                "name", "removeItem", 
+                "description", "Remove a specified quantity of an item from the shopping list. Specify item name and quantity to remove.",
+                "inputSchema", Map.of(
+                    "type", "object",
+                    "properties", Map.of(
+                        "name", Map.of("type", "string", "description", "Item name"),
+                        "quantity", Map.of("type", "integer", "description", "Quantity to remove")
+                    ),
+                    "required", new String[]{"name", "quantity"}
+                )
+            ));
+            
+            response.put("result", Map.of("tools", tools));
+        } else if ("tools/call".equals(method)) {
+            // Handle tool execution
+            @SuppressWarnings("unchecked")
+            Map<String, Object> params = (Map<String, Object>) message.get("params");
+            String toolName = (String) params.get("name");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> arguments = (Map<String, Object>) params.get("arguments");
+            
+            Object result = null;
+            
+            try {
+                if ("addItem".equals(toolName)) {
+                    String name = (String) arguments.get("name");
+                    Integer quantity = (Integer) arguments.get("quantity");
+                    result = shoppingCart.addItem(name, quantity);
+                } else if ("getItems".equals(toolName)) {
+                    result = shoppingCart.getItems();
+                } else if ("removeItem".equals(toolName)) {
+                    String name = (String) arguments.get("name");
+                    Integer quantity = (Integer) arguments.get("quantity");
+                    result = shoppingCart.removeItem(name, quantity);
+                } else {
+                    response.put("error", Map.of(
+                        "code", -32601,
+                        "message", "Tool not found: " + toolName
+                    ));
+                    return ResponseEntity.ok(response);
+                }
+                
+                response.put("result", Map.of(
+                    "content", List.of(Map.of(
+                        "type", "text",
+                        "text", result.toString()
+                    ))
+                ));
+            } catch (Exception e) {
+                response.put("error", Map.of(
+                    "code", -32603,
+                    "message", "Tool execution failed: " + e.getMessage()
+                ));
+            }
+        } else {
+            response.put("error", Map.of(
+                "code", -32601,
+                "message", "Method not found"
+            ));
+        }
+        
+        return ResponseEntity.ok(response);
+    }
+    
+    @GetMapping("/status")
+    public ResponseEntity<Map<String, Object>> getServerStatus() {
+        Map<String, Object> status = Map.of(
+            "server", "shopping-list-mcp-server",
+            "version", "1.0.0",
+            "transport", "HTTPS/SSE",
+            "port", 8443,
+            "connected_clients", clients.size(),
+            "mcp_inspector_ready", true
+        );
+        return ResponseEntity.ok(status);
+    }
+}
